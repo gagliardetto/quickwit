@@ -98,6 +98,7 @@ impl AsyncActor for GarbageCollector {
             self.metastore.clone(),
             GRACE_PERIOD,
             false,
+            Some(ctx),
         )
         .await?;
 
