@@ -39,3 +39,9 @@ pub struct PackagedSplit {
     pub tags: HashSet<String>,
     pub split_date_of_birth: Instant,
 }
+
+impl PackagedSplit {
+    pub fn num_bytes(&self) -> u64 {
+        self.footer_offsets.end
+    }
+}

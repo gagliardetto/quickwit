@@ -138,13 +138,13 @@ pub async fn delete_splits_with_files(
     let mut failed_split_ids: Vec<String> = Vec::new();
 
     let mut delete_splits_results_stream = tokio_stream::iter(splits.into_iter())
-        .map(|meta| {
+        .map(|split| {
             let moved_storage = storage.clone();
             async move {
-                let file_entry = FileEntry::from(&meta);
+                let file_entry = FileEntry::from(&split);
                 let delete_result = moved_storage.delete(Path::new(&file_entry.file_name)).await;
                 (
-                    meta.split_metadata.split_id.clone(),
+                    split.split_metadata.split_id.clone(),
                     file_entry,
                     delete_result.is_ok(),
                 )

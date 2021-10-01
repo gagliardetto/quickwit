@@ -18,15 +18,15 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashMap;
-use std::fs;
-use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
+use std::{fs, io};
 
-use async_trait::async_trait;
-use bytes::Bytes;
+use anyhow::Context;
+use quickwit_common::split_file;
 use tokio::sync::Mutex;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{LocalFileStorage, PutPayload, Storage, StorageErrorKind, StorageResult};
 
@@ -79,6 +79,58 @@ pub struct StorageWithUploadCache {
 }
 
 impl StorageWithUploadCache {
+    /// Create a storage with upload cache in a temp directory for tests.
+    #[cfg(feature = "testsuite")]
+    pub fn for_test(remote_storage: Arc<dyn Storage>) -> Self {
+        StorageWithUploadCache {
+            remote_storage,
+            local_storage: LocalFileStorage::for_test(),
+            cache_items: Mutex::new(Default::default()),
+            cache_params: CacheParams::default(),
+        }
+    }
+
+    pub async fn store_split(
+        &self,
+        split_id: &str,
+        split_num_bytes: usize,
+        path: &Path,
+        is_mature: bool,
+    ) -> anyhow::Result<()> {
+        let key = PathBuf::from(quickwit_common::split_file(split_id));
+        let payload = PutPayload::from(path.to_path_buf());
+        self.remote_storage
+            .put(&key, payload)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed uploading key {} in bucket {}",
+                    key.display(),
+                    self.remote_storage.uri()
+                )
+            })?;
+        if !is_mature {
+            self.move_into_cache(split_id, split_num_bytes, path)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete(&self, split_id: &str) -> StorageResult<()> {
+        let split_filename = quickwit_common::split_file(split_id);
+        let split_path = Path::new(&split_filename);
+        self.remote_storage.delete(split_path).await?;
+
+        let mut locked_cache_item = self.cache_items.lock().await;
+        if locked_cache_item.contains_key(split_path) {
+            if let Err(error) = self.local_storage.delete(split_path).await {
+                warn!(file_path = %split_path.display(), error = %error, "Could not remove file from local storage.");
+            }
+            locked_cache_item.remove(&split_path.to_path_buf());
+        }
+        Ok(())
+    }
+
     /// Create an instance of [`StorageWithUploadCache`]
     ///
     /// It needs the remote storage to work with.
@@ -141,23 +193,35 @@ impl StorageWithUploadCache {
         })
     }
 
-    /// Takes a snapshot of the cache view (only used for testing).
-    #[cfg(test)]
-    async fn inspect(&self) -> HashMap<PathBuf, usize> {
-        self.cache_items.lock().await.clone()
-    }
-}
-
-#[async_trait]
-impl Storage for StorageWithUploadCache {
-    async fn put(&self, path: &Path, payload: PutPayload) -> StorageResult<()> {
-        self.remote_storage.put(path, payload.clone()).await?;
-
-        // Ignore if path ends with `CACHE_TEMP_FILE_EXTENSION`.
-        if path.to_string_lossy().ends_with(CACHE_TEMP_FILE_EXTENSION) {
-            return Ok(());
+    pub async fn fetch_split(&self, split_id: &str, output_path: &Path) -> StorageResult<()> {
+        let path = PathBuf::from(quickwit_common::split_file(&split_id));
+        let mut cache_lock = self.cache_items.lock().await;
+        let is_file_exist_in_cache = cache_lock.contains_key(&path);
+        if is_file_exist_in_cache {
+            let copy_to_result = self.local_storage.move_out(&path, output_path).await;
+            match copy_to_result {
+                Ok(_) => {
+                    cache_lock.remove(&path);
+                    return Ok(());
+                }
+                Err(error) => {
+                    error!(file_path = %path.display(), error = %error, "Could not copy file from local storage.");
+                }
+            }
         }
+        let start_time = Instant::now();
+        info!(split_id=%split_id, output_path=?output_path, "fetch-split-from-remote-storage");
+        self.remote_storage.copy_to_file(&path, output_path).await?;
+        info!(split_id=%split_id, output_path=?output_path, elapsed=?start_time.elapsed(), "fetch-split-from_remote-storage-end");
+        Ok(())
+    }
 
+    pub async fn move_into_cache(
+        &self,
+        split_id: &str,
+        split_num_bytes: usize,
+        bundle_path: &Path,
+    ) -> io::Result<()> {
         let (num_entries, size_in_bytes_entries) = {
             let locked_cache_item = self.cache_items.lock().await;
             (
@@ -175,83 +239,32 @@ impl Storage for StorageWithUploadCache {
             return Ok(());
         }
 
-        let payload_length = payload.len().await? as usize;
         // Ignore storing a file whose size exceeds the max file size.
-        if payload_length > self.cache_params.max_file_size {
+        if split_num_bytes > self.cache_params.max_file_size {
             warn!("Failed to cache file: maximum size in bytes per file exceeded.");
             return Ok(());
         }
 
         // Ignore storing a file that cannot fit in the cache.
-        if payload_length + size_in_bytes_entries > self.cache_params.max_num_bytes {
+        if split_num_bytes + size_in_bytes_entries > self.cache_params.max_num_bytes {
             warn!("Failed to cache file: maximum size in bytes of cache exceeded.");
             return Ok(());
         }
 
-        // Safely copy using intermediate temp file.
-        let temp_file_path = format!("{}{}", path.to_string_lossy(), CACHE_TEMP_FILE_EXTENSION);
+        let split_filename = PathBuf::from(split_file(split_id));
         self.local_storage
-            .put(Path::new(&temp_file_path), payload)
-            .await?;
-        self.local_storage
-            .move_to(Path::new(&temp_file_path), path)
+            .move_into(bundle_path, &split_filename)
             .await?;
 
         let mut locked_cache_items = self.cache_items.lock().await;
-        locked_cache_items.insert(path.to_path_buf(), payload_length);
+        locked_cache_items.insert(split_filename, split_num_bytes);
         Ok(())
     }
 
-    async fn copy_to_file(&self, path: &Path, output_path: &Path) -> StorageResult<()> {
-        // Ignore cache if path ends with `CACHE_TEMP_FILE_EXTENSION`.
-        if path.to_string_lossy().ends_with(CACHE_TEMP_FILE_EXTENSION) {
-            return self.remote_storage.copy_to_file(path, output_path).await;
-        }
-
-        let is_file_exist_in_cache = self
-            .cache_items
-            .lock()
-            .await
-            .contains_key(&path.to_path_buf());
-        if is_file_exist_in_cache {
-            let copy_to_result = self.local_storage.copy_to_file(path, output_path).await;
-            match copy_to_result {
-                Ok(_) => return Ok(()),
-                Err(error) => {
-                    error!(file_path = %path.to_string_lossy(), error = %error, "Could not copy file from local storage.");
-                }
-            }
-        }
-        self.remote_storage.copy_to_file(path, output_path).await
-    }
-
-    async fn get_slice(&self, path: &Path, range: Range<usize>) -> StorageResult<Bytes> {
-        self.remote_storage.get_slice(path, range).await
-    }
-
-    async fn get_all(&self, path: &Path) -> StorageResult<Bytes> {
-        self.remote_storage.get_all(path).await
-    }
-
-    async fn delete(&self, path: &Path) -> StorageResult<()> {
-        self.remote_storage.delete(path).await?;
-
-        let mut locked_cache_item = self.cache_items.lock().await;
-        if locked_cache_item.contains_key(&path.to_path_buf()) {
-            if let Err(error) = self.local_storage.delete(path).await {
-                warn!(file_path = %path.to_string_lossy(), error = %error, "Could not remove file from local storage.");
-            }
-            locked_cache_item.remove(&path.to_path_buf());
-        }
-        Ok(())
-    }
-
-    async fn file_num_bytes(&self, path: &Path) -> StorageResult<u64> {
-        self.remote_storage.file_num_bytes(path).await
-    }
-
-    fn uri(&self) -> String {
-        self.remote_storage.uri()
+    /// Takes a snapshot of the cache view (only used for testing).
+    #[cfg(test)]
+    async fn inspect(&self) -> HashMap<PathBuf, usize> {
+        self.cache_items.lock().await.clone()
     }
 }
 
@@ -260,7 +273,7 @@ pub fn create_storage_with_upload_cache(
     remote_storage: Arc<dyn Storage>,
     cache_dir: &Path,
     cache_params: CacheParams,
-) -> crate::StorageResult<Arc<dyn Storage>> {
+) -> crate::StorageResult<Arc<StorageWithUploadCache>> {
     let storage = StorageWithUploadCache::create(remote_storage, cache_dir, cache_params)?;
     Ok(Arc::new(storage))
 }

@@ -188,8 +188,8 @@ impl IndexingPipelineSupervisor {
         // Using the scratch_directory directly is fine since the cache storage will create its own
         // folder to work with.
         let cache_directory = self.params.indexer_params.scratch_directory.path();
-        let index_storage = create_storage_with_upload_cache(
-            index_storage,
+        let split_storage = create_storage_with_upload_cache(
+            index_storage.clone(),
             cache_directory,
             CacheParams::default(),
         )?;
@@ -203,11 +203,15 @@ impl IndexingPipelineSupervisor {
             QueueCapacity::Unbounded,
         );
 
+        let merge_policy: Arc<dyn MergePolicy> =
+            Arc::new(StableMultitenantWithTimestampMergePolicy::default());
+
         // Merge uploader
         let merge_uploader = Uploader::new(
             self.params.metastore.clone(),
-            index_storage.clone(),
+            split_storage.clone(),
             publisher_mailbox.clone(),
+            merge_policy.clone(),
         );
         let (merge_uploader_mailbox, merge_uploader_handler) = ctx
             .spawn_actor(merge_uploader)
@@ -230,7 +234,7 @@ impl IndexingPipelineSupervisor {
 
         let merge_split_downloader = MergeSplitDownloader {
             scratch_directory: self.params.indexer_params.scratch_directory.clone(),
-            storage: index_storage.clone(),
+            storage: split_storage.clone(),
             merge_executor_mailbox,
         };
         let (merge_split_downloader_mailbox, merge_split_downloader_handler) = ctx
@@ -239,9 +243,8 @@ impl IndexingPipelineSupervisor {
             .spawn_async();
 
         // Merge planner
-        let merge_policy: Arc<dyn MergePolicy> =
-            Arc::new(StableMultitenantWithTimestampMergePolicy::default());
-        let mut merge_planner = MergePlanner::new(merge_policy, merge_split_downloader_mailbox);
+        let mut merge_planner =
+            MergePlanner::new(merge_policy.clone(), merge_split_downloader_mailbox);
         for split in self
             .params
             .metastore
@@ -267,8 +270,9 @@ impl IndexingPipelineSupervisor {
         // Uploader
         let uploader = Uploader::new(
             self.params.metastore.clone(),
-            index_storage.clone(),
+            split_storage.clone(),
             publisher_mailbox,
+            merge_policy,
         );
         let (uploader_mailbox, uploader_handler) = ctx
             .spawn_actor(uploader)

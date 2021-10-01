@@ -18,45 +18,48 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::mem;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 use async_trait::async_trait;
 use fail::fail_point;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, AsyncActor, Mailbox, QueueCapacity};
 use quickwit_metastore::{Metastore, SplitMetadata, SplitMetadataAndFooterOffsets, SplitState};
-use quickwit_storage::{PutPayload, Storage, BUNDLE_FILENAME};
+use quickwit_storage::{StorageWithUploadCache, BUNDLE_FILENAME};
 use tantivy::chrono::Utc;
 use tokio::sync::oneshot::Receiver;
 use tracing::{info, warn};
 
 use crate::models::{PackagedSplit, PublishOperation, PublisherMessage};
 use crate::semaphore::Semaphore;
+use crate::MergePolicy;
 
 pub const MAX_CONCURRENT_SPLIT_UPLOAD: usize = 6;
 
 pub struct Uploader {
     metastore: Arc<dyn Metastore>,
-    index_storage: Arc<dyn Storage>,
+    index_storage: Arc<StorageWithUploadCache>,
     publisher_mailbox: Mailbox<Receiver<PublisherMessage>>,
     concurrent_upload_permits: Semaphore,
+    merge_policy: Arc<dyn MergePolicy>,
     counters: UploaderCounters,
 }
 
 impl Uploader {
     pub fn new(
         metastore: Arc<dyn Metastore>,
-        index_storage: Arc<dyn Storage>,
+        index_storage: Arc<StorageWithUploadCache>,
         publisher_mailbox: Mailbox<Receiver<PublisherMessage>>,
+        merge_policy: Arc<dyn MergePolicy>,
     ) -> Uploader {
         Uploader {
             metastore,
             index_storage,
             publisher_mailbox,
             concurrent_upload_permits: Semaphore::new(MAX_CONCURRENT_SPLIT_UPLOAD),
+            merge_policy,
             counters: Default::default(),
         }
     }
@@ -86,22 +89,21 @@ impl Actor for Uploader {
 /// Upload all files within a single split to the storage
 async fn put_split_file_to_storage(
     split: &PackagedSplit,
-    storage: &dyn Storage,
+    storage: &StorageWithUploadCache,
+    is_mature: bool,
 ) -> anyhow::Result<()> {
     let bundle_path = split.split_scratch_directory.path().join(BUNDLE_FILENAME);
-    let key = PathBuf::from(format!("{}.split", &split.split_id));
 
     let start = Instant::now();
-
     info!(bundle_path=%bundle_path.display(), split_id=%split.split_id, "upload-split-bundle");
-    let payload = PutPayload::from(bundle_path);
-    storage.put(&key, payload).await.with_context(|| {
-        format!(
-            "Failed uploading key {} in bucket {}",
-            key.display(),
-            storage.uri()
+    storage
+        .store_split(
+            &split.split_id,
+            split.num_bytes() as usize,
+            &bundle_path,
+            is_mature,
         )
-    })?;
+        .await?;
 
     let elapsed_secs = start.elapsed().as_secs_f32();
     let split_size_in_megabytes = split.footer_offsets.end / 1_000_000;
@@ -154,19 +156,21 @@ fn make_publish_operation(
 
 async fn stage_and_upload_split(
     packaged_split: PackagedSplit,
-    index_storage: &dyn Storage,
+    index_storage: &StorageWithUploadCache,
     metastore: &dyn Metastore,
     counters: UploaderCounters,
+    merge_policy: &dyn MergePolicy,
 ) -> anyhow::Result<PublisherMessage> {
     let split_metadata_and_footer_offsets = create_split_metadata(&packaged_split);
     let index_id = packaged_split.index_id.clone();
     let split_metadata = split_metadata_and_footer_offsets.split_metadata.clone();
-    info!(split_id=%packaged_split.split_id, "staging-split");
+    let is_mature = merge_policy.is_mature(&split_metadata);
+    info!(split_id=%packaged_split.split_id,  is_mature=%is_mature, "staging-split",);
     metastore
         .stage_split(&index_id, split_metadata_and_footer_offsets)
         .await?;
     counters.num_staged_splits.fetch_add(1, Ordering::SeqCst);
-    put_split_file_to_storage(&packaged_split, &*index_storage).await?;
+    put_split_file_to_storage(&packaged_split, &*index_storage, is_mature).await?;
     counters.num_uploaded_splits.fetch_add(1, Ordering::SeqCst);
     let publish_operation = make_publish_operation(split_metadata, packaged_split);
     Ok(PublisherMessage {
@@ -211,24 +215,29 @@ impl AsyncActor for Uploader {
         }
         let metastore = self.metastore.clone();
         let index_storage = self.index_storage.clone();
+        let merge_policy = self.merge_policy.clone();
 
         let counters = self.counters.clone();
 
         tokio::spawn(async move {
             fail_point!("uploader:intask:before");
-            let stage_and_upload_res: anyhow::Result<()> =
-                stage_and_upload_split(split, &*index_storage, &*metastore, counters)
-                    .await
-                    .and_then(|publisher_message| {
-                        if let Err(publisher_message) = split_uploaded_tx.send(publisher_message) {
-                            bail!(
-                                "Failed to send upload split `{:?}`. The publisher is probably \
-                                 dead.",
-                                &publisher_message
-                            );
-                        }
-                        Ok(())
-                    });
+            let stage_and_upload_res: anyhow::Result<()> = stage_and_upload_split(
+                split,
+                &*index_storage,
+                &*metastore,
+                counters,
+                &*merge_policy,
+            )
+            .await
+            .and_then(|publisher_message| {
+                if let Err(publisher_message) = split_uploaded_tx.send(publisher_message) {
+                    bail!(
+                        "Failed to send upload split `{:?}`. The publisher is probably dead.",
+                        &publisher_message
+                    );
+                }
+                Ok(())
+            });
             if let Err(cause) = stage_and_upload_res {
                 warn!(cause=%cause, "Failed to upload split. Killing!");
                 kill_switch.kill();
@@ -244,6 +253,8 @@ impl AsyncActor for Uploader {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use quickwit_actors::{create_test_mailbox, ObservationType, Universe};
     use quickwit_metastore::checkpoint::CheckpointDelta;
     use quickwit_metastore::MockMetastore;
@@ -251,6 +262,7 @@ mod tests {
 
     use super::*;
     use crate::models::ScratchDirectory;
+    use crate::StableMultitenantWithTimestampMergePolicy;
 
     #[tokio::test]
     async fn test_uploader() -> anyhow::Result<()> {
@@ -269,8 +281,17 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
         let ram_storage = RamStorage::default();
-        let index_storage: Arc<dyn Storage> = Arc::new(ram_storage.clone());
-        let uploader = Uploader::new(Arc::new(mock_metastore), index_storage.clone(), mailbox);
+        let index_storage: Arc<StorageWithUploadCache> = Arc::new(
+            StorageWithUploadCache::for_test(Arc::new(ram_storage.clone())),
+        );
+        let merge_policy: Arc<dyn MergePolicy> =
+            Arc::new(StableMultitenantWithTimestampMergePolicy::default());
+        let uploader = Uploader::new(
+            Arc::new(mock_metastore),
+            index_storage,
+            mailbox,
+            merge_policy,
+        );
         let (uploader_mailbox, uploader_handle) = universe.spawn_actor(uploader).spawn_async();
         let split_scratch_directory = ScratchDirectory::try_new_temp()?;
         std::fs::write(
@@ -338,8 +359,17 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
         let ram_storage = RamStorage::default();
-        let index_storage: Arc<dyn Storage> = Arc::new(ram_storage.clone());
-        let uploader = Uploader::new(Arc::new(mock_metastore), index_storage.clone(), mailbox);
+        let index_storage: Arc<StorageWithUploadCache> = Arc::new(
+            StorageWithUploadCache::for_test(Arc::new(ram_storage.clone())),
+        );
+        let merge_policy: Arc<dyn MergePolicy> =
+            Arc::new(StableMultitenantWithTimestampMergePolicy::default());
+        let uploader = Uploader::new(
+            Arc::new(mock_metastore),
+            index_storage,
+            mailbox,
+            merge_policy,
+        );
         let (uploader_mailbox, uploader_handle) = universe.spawn_actor(uploader).spawn_async();
         let split_scratch_directory = ScratchDirectory::try_new_temp()?;
         std::fs::write(

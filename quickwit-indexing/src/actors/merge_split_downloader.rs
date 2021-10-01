@@ -19,21 +19,20 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use quickwit_actors::{Actor, ActorContext, AsyncActor, Mailbox, QueueCapacity};
 use quickwit_common::split_file;
 use quickwit_metastore::SplitMetadata;
-use quickwit_storage::Storage;
-use tracing::{debug, info};
+use quickwit_storage::StorageWithUploadCache;
+use tracing::info;
 
 use crate::merge_policy::MergeOperation;
 use crate::models::{MergeScratch, ScratchDirectory};
 
 pub struct MergeSplitDownloader {
     pub scratch_directory: ScratchDirectory,
-    pub storage: Arc<dyn Storage>,
+    pub storage: Arc<StorageWithUploadCache>,
     pub merge_executor_mailbox: Mailbox<MergeScratch>,
 }
 
@@ -95,11 +94,9 @@ impl MergeSplitDownloader {
             let split_file = Path::new(&split_filename);
             let dest_path = download_directory.join(split_file);
             let _protect_guard = ctx.protect_zone();
-            let start_time = Instant::now();
-            debug!(split_file=?split_file, dest_path=?dest_path, "download-file");
-            self.storage.copy_to_file(split_file, &dest_path).await?;
-            let elapsed = start_time.elapsed();
-            debug!(split_file=?split_file, elapsed=?elapsed, "download-file-end");
+            self.storage
+                .fetch_split(&split.split_id, &dest_path)
+                .await?;
         }
         Ok(())
     }
@@ -135,7 +132,8 @@ mod tests {
                 storage_builder =
                     storage_builder.put(&split_file(&split.split_id), &b"split_payload"[..]);
             }
-            storage_builder.build()
+            let ram_storage = storage_builder.build();
+            StorageWithUploadCache::for_test(Arc::new(ram_storage))
         });
 
         let universe = Universe::new();

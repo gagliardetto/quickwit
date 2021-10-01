@@ -26,6 +26,7 @@ use std::{fmt, io};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
+use tempfile::TempDir;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::warn;
@@ -36,6 +37,8 @@ use crate::{PutPayload, Storage, StorageErrorKind, StorageFactory, StorageResult
 #[derive(Clone)]
 pub struct LocalFileStorage {
     root: PathBuf,
+    #[cfg(feature = "testsuite")]
+    _temp_dir: Option<Arc<TempDir>>,
 }
 
 impl fmt::Debug for LocalFileStorage {
@@ -45,10 +48,24 @@ impl fmt::Debug for LocalFileStorage {
 }
 
 impl LocalFileStorage {
+    /// Create a local file storage in a temp directory for tests.
+    #[cfg(feature = "testsuite")]
+    pub fn for_test() -> Self {
+        let temp_dir = tempfile::tempdir().unwrap();
+        LocalFileStorage {
+            root: temp_dir.path().to_path_buf(),
+            _temp_dir: Some(Arc::new(temp_dir)),
+        }
+    }
+
     /// Creates a file storage instance given a uri
     pub fn from_uri(uri: &str) -> StorageResult<LocalFileStorage> {
         let root_pathbuf = Self::extract_root_path_from_uri(uri)?;
-        Ok(Self { root: root_pathbuf })
+        Ok(Self {
+            root: root_pathbuf,
+            #[cfg(feature = "testsuite")]
+            _temp_dir: None,
+        })
     }
 
     /// Validates if the provided uri is of the correct protocol & extracts the root path.
@@ -88,10 +105,18 @@ impl LocalFileStorage {
     }
 
     /// Moves a file from a source to a destination.
-    pub async fn move_to(&self, from: &Path, to: &Path) -> crate::StorageResult<()> {
-        let from_full_path = self.root.join(from);
+    /// from here is an external path, and to is an internal path.
+    pub async fn move_into(&self, from_external: &Path, to: &Path) -> crate::StorageResult<()> {
         let to_full_path = self.root.join(to);
-        fs::rename(from_full_path, to_full_path).await?;
+        fs::rename(from_external, to_full_path).await?;
+        Ok(())
+    }
+
+    /// Moves a file from a source to a destination.
+    /// from here is an external path, and to is an internal path.
+    pub async fn move_out(&self, from_internal: &Path, to: &Path) -> crate::StorageResult<()> {
+        let from_full_path = self.root.join(from_internal);
+        fs::rename(from_full_path, to).await?;
         Ok(())
     }
 }
